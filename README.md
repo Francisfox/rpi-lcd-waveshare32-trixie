@@ -84,6 +84,7 @@ ROTATE=90 SPEED=8000000 DPI=60 ./lcd-setup.sh install
 | `ICONSIZE` | 16 | Ícones da barra superior |
 | `PANEL_HEIGHT` | 20 | Altura da barra superior |
 | `DESKTOP_ICON` | 24 | Ícones da área de trabalho (ex.: lixeira) |
+| `SPLASH` | 1 | Tela de abertura em tela cheia no LCD e mensagens de boot ocultas (`0` desativa) |
 
 ## 6. Ajustes finais
 
@@ -138,6 +139,8 @@ Conecte um visualizador VNC (RealVNC Viewer, TightVNC) em `localhost:5900`.
 | Remoção do `99-fbturbo.conf` | Sobra do LCD-show; driver inexistente no Trixie |
 | `logind-check-graphical=false` no lightdm | Sem KMS, o logind marca `CanGraphical=no` e o lightdm não inicia o X |
 | Barra 16 px, `Xft.dpi: 72`, ícones da área de trabalho 24 px | Proporção adequada para 320×240 |
+| Serviço `lcd-splash` (fbi no `/dev/fb1`) | Sem KMS, o Plymouth não aparece; o serviço recria a tela de abertura no LCD |
+| `quiet loglevel=3 systemd.show_status=false vt.global_cursor_default=0 logo.nologo` no `cmdline.txt` | Oculta o texto de inicialização, que sobrepunha a imagem |
 
 ## Solução de problemas
 
@@ -150,7 +153,8 @@ Conecte um visualizador VNC (RealVNC Viewer, TightVNC) em `localhost:5900`.
 | Erro no `apt update` (*MergeList*) | Lista de pacotes corrompida | `sudo rm -rf /var/lib/apt/lists/* && sudo apt update` |
 | `throttled` diferente de `0x0` | Fonte ou cabo insuficiente | Trocar a fonte; usar hub com fonte própria para periféricos |
 | Dispositivo USB não aparece no `lsblk` | Falta de energia | Mesma ação acima |
-
+| Texto aparece por cima da tela de abertura | Mensagens de boot no mesmo terminal | Conferir `cmdline.txt` com `./lcd-setup.sh check` |
+| Quer ver as mensagens de boot | — | `SPLASH=0 ./lcd-setup.sh install` e restaurar `cmdline.txt.bak-*` |
 **Antes de qualquer `apt upgrade`, rode `./lcd-setup.sh backup`.**
 
 ## Sobre boot por USB (Pi 2 v1.1)
