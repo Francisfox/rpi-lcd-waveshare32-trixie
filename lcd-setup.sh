@@ -10,9 +10,11 @@ DPI="${DPI:-72}"
 ICONSIZE="${ICONSIZE:-16}"
 PANEL_HEIGHT="${PANEL_HEIGHT:-20}"
 DESKTOP_ICON="${DESKTOP_ICON:-24}"
+SPLASH="${SPLASH:-1}"
 
 # ---------- Caminhos ----------
 CFG=/boot/firmware/config.txt
+CMDLINE=/boot/firmware/cmdline.txt
 OVERLAY_FILE=/boot/firmware/overlays/waveshare32b.dtbo
 XCONF=/etc/X11/xorg.conf.d/99-lcd.conf
 LDM=/etc/lightdm/lightdm.conf
@@ -21,6 +23,8 @@ PANEL="$PANEL_DIR/panel"
 PANEL_DEFAULT=/etc/xdg/lxpanel-pi/panels/panel
 PCMAN_DIR="$HOME/.config/pcmanfm/default"
 PCMAN_DEFAULT=/etc/xdg/pcmanfm/default/pcmanfm.conf
+SPLASH_IMG=/usr/share/plymouth/themes/pix/splash.png
+SPLASH_SVC=/etc/systemd/system/lcd-splash.service
 BACKUP_DIR="$HOME/backup-lcd"
 STAMP="$(date +%Y%m%d-%H%M)"
 OVERLAY_LINE="dtoverlay=waveshare32b,rotate=${ROTATE},speed=${SPEED}"
@@ -40,6 +44,7 @@ preflight() {
   [ -f "$CFG" ] || fail "Não encontrei $CFG. Este script é para Raspberry Pi OS Bookworm/Trixie."
   grep -q "trixie" /etc/os-release || warn "Sistema diferente do Trixie: testado apenas no Trixie."
   is_text "$CFG" || fail "$CFG está corrompido (bytes nulos). Restaure um backup antes de continuar."
+  is_text "$CMDLINE" || fail "$CMDLINE está corrompido (bytes nulos). Restaure um backup antes de continuar."
   [ -f "$OVERLAY_FILE" ] || fail "Overlay waveshare32b não encontrado em /boot/firmware/overlays."
   local t; t=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2 || echo "?")
   [ "$t" = "0x0" ] || warn "Energia: throttled=$t. Fonte insuficiente pode corromper o cartão SD."
@@ -54,7 +59,7 @@ step_packages() {
     sudo rm -rf /var/lib/apt/lists/*
     sudo apt-get update
   fi
-  sudo apt-get install -y xserver-xorg-video-fbdev xinput-calibrator
+  sudo apt-get install -y xserver-xorg-video-fbdev xinput-calibrator fbi
   ok "Pacotes instalados"
 }
 
@@ -152,11 +157,60 @@ step_desktop() {
   fi
 }
 
+step_splash() {
+  if [ "$SPLASH" != "1" ]; then info "Tela de abertura desativada (SPLASH=0)"; return 0; fi
+  info "Configurando tela de abertura no LCD"
+  if [ ! -f "$SPLASH_IMG" ]; then
+    warn "Imagem $SPLASH_IMG não encontrada — tela de abertura não configurada"
+    return 0
+  fi
+
+  # Serviço que mostra a imagem no LCD assim que o driver carrega
+  sudo tee "$SPLASH_SVC" > /dev/null <<'EOF'
+[Unit]
+Description=Imagem de abertura no LCD
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=lightdm.service
+
+[Service]
+Type=simple
+RemainAfterExit=yes
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do [ -e /dev/fb1 ] && exit 0; sleep 0.5; done; exit 1'
+ExecStart=/usr/bin/fbi -d /dev/fb1 -T 2 --noverbose -a /usr/share/plymouth/themes/pix/splash.png
+StandardInput=tty
+TTYPath=/dev/tty2
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+  # Encerra a imagem quando o desktop abre
+  sudo mkdir -p /etc/systemd/system/lightdm.service.d
+  sudo tee /etc/systemd/system/lightdm.service.d/stop-splash.conf > /dev/null <<'EOF'
+[Service]
+ExecStartPre=-/usr/bin/pkill -x fbi
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable lcd-splash.service
+
+  # Oculta as mensagens de inicialização
+  sudo cp "$CMDLINE" "$CMDLINE.bak-$STAMP"
+  for p in quiet loglevel=3 systemd.show_status=false vt.global_cursor_default=0 logo.nologo; do
+    grep -qw -- "$p" "$CMDLINE" || sudo sed -i "s/\$/ $p/" "$CMDLINE"
+  done
+  [ "$(wc -l < "$CMDLINE")" -le 1 ] || fail "cmdline.txt ficou com mais de uma linha. Backup em $CMDLINE.bak-$STAMP"
+  sync
+  ok "Tela de abertura ativa e mensagens de boot ocultas (backup: $CMDLINE.bak-$STAMP)"
+}
+
 # ---------- Comandos ----------
 cmd_backup() {
   mkdir -p "$BACKUP_DIR"
   sudo cp "$CFG" "$BACKUP_DIR/config.txt"
+  sudo cp "$CMDLINE" "$BACKUP_DIR/cmdline.txt"
   [ -f "$XCONF" ] && sudo cp "$XCONF" "$BACKUP_DIR/"
+  [ -f "$SPLASH_SVC" ] && sudo cp "$SPLASH_SVC" "$BACKUP_DIR/"
   sudo cp "$LDM" "$BACKUP_DIR/"
   [ -d "$HOME/.config/lxpanel-pi" ] && cp -r "$HOME/.config/lxpanel-pi" "$BACKUP_DIR/"
   [ -d "$HOME/.config/pcmanfm" ] && cp -r "$HOME/.config/pcmanfm" "$BACKUP_DIR/"
@@ -173,6 +227,7 @@ cmd_install() {
   step_x11
   step_lightdm
   step_desktop
+  step_splash
   cmd_backup
   echo
   ok "Instalação concluída. É preciso reiniciar para aplicar."
@@ -181,20 +236,22 @@ cmd_install() {
 }
 
 cmd_check() {
-  echo "== Sistema";        grep PRETTY /etc/os-release; uname -r
-  echo "== Energia";        vcgencmd get_throttled || true
-  echo "== config.txt";     if is_text "$CFG"; then echo "íntegro (texto)"; else echo "CORROMPIDO"; fi
+  echo "== Sistema";            grep PRETTY /etc/os-release; uname -r
+  echo "== Energia";            vcgencmd get_throttled || true
+  echo "== config.txt";         if is_text "$CFG"; then echo "íntegro (texto)"; else echo "CORROMPIDO"; fi
   grep -nE "waveshare|vc4-kms|spi=on" "$CFG" || true
-  echo "== Framebuffers";   cat /proc/fb
-  echo "== Driver do LCD";  sudo dmesg | grep -iE "graphics fb1|fbtft|ili9340" | tail -5 || true
-  echo "== logind";         loginctl show-seat seat0 -p CanGraphical || true
-  echo "== lightdm";        grep -n "logind-check-graphical" "$LDM" || echo "ajuste ausente"
+  echo "== cmdline.txt";        cat "$CMDLINE"
+  echo "== Framebuffers";       cat /proc/fb
+  echo "== Driver do LCD";      sudo dmesg | grep -iE "graphics fb1|fbtft|ili9340" | tail -5 || true
+  echo "== logind";             loginctl show-seat seat0 -p CanGraphical || true
+  echo "== lightdm";            grep -n "logind-check-graphical" "$LDM" || echo "ajuste ausente"
   systemctl is-active lightdm || true
-  echo "== Xorg (erros)";   grep -E "\(EE\)|fb1" /var/log/Xorg.0.log 2>/dev/null | tail -8 || true
-  echo "== Barra";          grep -nE "iconsize|^\s*height=" "$PANEL" 2>/dev/null || echo "sem configuração de usuário"
-  echo "== Fontes";         grep "Xft.dpi" "$HOME/.Xresources" 2>/dev/null || echo "DPI padrão"
-  echo "== Ícones desktop"; grep "big_icon_size" "$PCMAN_DIR/pcmanfm.conf" 2>/dev/null || echo "padrão (48)"
-  echo "== Cartão SD";      sudo dmesg | grep -iE "i/o error|fat-fs|ext4-fs error" | tail -5 || echo "sem erros"
+  echo "== Xorg (erros)";       grep -E "\(EE\)|fb1" /var/log/Xorg.0.log 2>/dev/null | tail -8 || true
+  echo "== Barra";              grep -nE "iconsize|^\s*height=" "$PANEL" 2>/dev/null || echo "sem configuração de usuário"
+  echo "== Fontes";             grep "Xft.dpi" "$HOME/.Xresources" 2>/dev/null || echo "DPI padrão"
+  echo "== Ícones desktop";     grep "big_icon_size" "$PCMAN_DIR/pcmanfm.conf" 2>/dev/null || echo "padrão (48)"
+  echo "== Tela de abertura";   systemctl is-enabled lcd-splash.service 2>/dev/null || echo "não configurada"
+  echo "== Cartão SD";          sudo dmesg | grep -iE "i/o error|fat-fs|ext4-fs error" | tail -5 || echo "sem erros"
   df -h / /boot/firmware
 }
 
@@ -244,8 +301,8 @@ Uso: ./lcd-setup.sh <comando>
   hdmi       Devolve o desktop ao HDMI
 
 Parâmetros: ROTATE=$ROTATE SPEED=$SPEED DPI=$DPI ICONSIZE=$ICONSIZE
-            PANEL_HEIGHT=$PANEL_HEIGHT DESKTOP_ICON=$DESKTOP_ICON
-Exemplo:    SPEED=8000000 ./lcd-setup.sh install
+            PANEL_HEIGHT=$PANEL_HEIGHT DESKTOP_ICON=$DESKTOP_ICON SPLASH=$SPLASH
+Exemplo:    SPLASH=0 ./lcd-setup.sh install
 EOF
 }
 
