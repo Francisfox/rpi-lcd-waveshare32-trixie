@@ -1,0 +1,5 @@
+.vnc/
+*.passwd
+*.bak*
+*.corrompido
+backup-lcd/
