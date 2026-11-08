@@ -54,13 +54,20 @@ ssh USUARIO@IP_DO_RASPBERRY
 
 ## 5. Instalar a configuração do LCD
 
+**Instalação rápida (um comando):**
+
 ```bash
-git clone https://github.com/SEU_USUARIO/rpi-lcd-waveshare32-trixie.git
+bash <(curl -fsSL https://raw.githubusercontent.com/Francisfox/rpi-lcd-waveshare32-trixie/main/lcd-setup.sh) install
+```
+
+**Ou clonando o repositório** (recomendado, para ter os outros comandos à mão):
+
+```bash
+git clone https://github.com/Francisfox/rpi-lcd-waveshare32-trixie.git
 cd rpi-lcd-waveshare32-trixie
 chmod +x lcd-setup.sh
 ./lcd-setup.sh install
 ```
-
 Rode **sem `sudo`**: o script pede a senha quando precisa. No final, ele oferece reiniciar.
 
 Parâmetros opcionais:
