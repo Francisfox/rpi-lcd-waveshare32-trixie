@@ -11,12 +11,17 @@ ICONSIZE="${ICONSIZE:-16}"
 PANEL_HEIGHT="${PANEL_HEIGHT:-20}"
 DESKTOP_ICON="${DESKTOP_ICON:-24}"
 SPLASH="${SPLASH:-1}"
+TOUCH="${TOUCH:-1}"                                   # 0 = não configura o touch
+TOUCH_INVERT="${TOUCH_INVERT:-invx}"                  # invx | invy | invx,invy | none
+CALIB_MATRIX="${CALIB_MATRIX:-1.1940 0 -0.0821 0 1.2329 -0.1807 0 0 1}"
+DESKTOP_PKG="${DESKTOP_PKG:-rpd-x-core}"              # instalado só se o desktop faltar (imagem Lite)
 
 # ---------- Caminhos ----------
 CFG=/boot/firmware/config.txt
 CMDLINE=/boot/firmware/cmdline.txt
-OVERLAY_FILE=/boot/firmware/overlays/waveshare32b.dtbo
+OVERLAY_DIR=/boot/firmware/overlays
 XCONF=/etc/X11/xorg.conf.d/99-lcd.conf
+CALIB=/etc/X11/xorg.conf.d/99-calibration.conf
 LDM=/etc/lightdm/lightdm.conf
 PANEL_DIR="$HOME/.config/lxpanel-pi/panels"
 PANEL="$PANEL_DIR/panel"
@@ -27,7 +32,12 @@ SPLASH_IMG=/usr/share/plymouth/themes/pix/splash.png
 SPLASH_SVC=/etc/systemd/system/lcd-splash.service
 BACKUP_DIR="$HOME/backup-lcd"
 STAMP="$(date +%Y%m%d-%H%M)"
-OVERLAY_LINE="dtoverlay=waveshare32b,rotate=${ROTATE},speed=${SPEED}"
+TOUCH_NAME="ADS7846 Touchscreen"
+
+# Definidos em detect_overlay()
+OVERLAY_MODE=""
+LCD_LINE=""
+TOUCH_LINE=""
 
 # ---------- Saída ----------
 ok()   { printf '\e[32m[OK]\e[0m   %s\n' "$*"; }
@@ -38,6 +48,27 @@ fail() { printf '\e[31m[ERRO]\e[0m %s\n' "$*"; exit 1; }
 # Arquivo de texto íntegro = sem bytes nulos
 is_text() { [ "$(tr -dc '\000' < "$1" | wc -c)" -eq 0 ]; }
 
+# ---------- Overlay do LCD ----------
+# Kernels antigos trazem o overlay dedicado waveshare32b.dtbo (já inclui o touch).
+# Nos kernels atuais ele foi removido: o mesmo preset virou parâmetro do overlay
+# genérico fbtft, e o touch passa a ser um overlay separado (ads7846).
+detect_overlay() {
+  if [ -f "$OVERLAY_DIR/waveshare32b.dtbo" ]; then
+    OVERLAY_MODE=legacy
+    LCD_LINE="dtoverlay=waveshare32b,rotate=${ROTATE},speed=${SPEED}"
+    TOUCH_LINE=""
+  elif [ -f "$OVERLAY_DIR/fbtft.dtbo" ]; then
+    OVERLAY_MODE=fbtft
+    LCD_LINE="dtoverlay=fbtft,spi0-0,waveshare32b,rotate=${ROTATE},speed=${SPEED},reset_pin=27,dc_pin=22"
+    local inv=""
+    [ "$TOUCH_INVERT" = "none" ] || inv=",${TOUCH_INVERT}"
+    TOUCH_LINE="dtoverlay=ads7846,cs=1,penirq=17,swapxy,pmax=255,xohms=60${inv}"
+    [ "$TOUCH" = "1" ] || TOUCH_LINE=""
+  else
+    fail "Nenhum overlay do LCD encontrado (waveshare32b.dtbo ou fbtft.dtbo) em $OVERLAY_DIR."
+  fi
+}
+
 # ---------- Verificações iniciais ----------
 preflight() {
   [ "$EUID" -ne 0 ] || fail "Rode sem sudo: ./lcd-setup.sh $1"
@@ -45,7 +76,15 @@ preflight() {
   grep -q "trixie" /etc/os-release || warn "Sistema diferente do Trixie: testado apenas no Trixie."
   is_text "$CFG" || fail "$CFG está corrompido (bytes nulos). Restaure um backup antes de continuar."
   is_text "$CMDLINE" || fail "$CMDLINE está corrompido (bytes nulos). Restaure um backup antes de continuar."
-  [ -f "$OVERLAY_FILE" ] || fail "Overlay waveshare32b não encontrado em /boot/firmware/overlays."
+  detect_overlay
+  if [ "$OVERLAY_MODE" = "fbtft" ]; then
+    ok "Overlay: fbtft com preset waveshare32b (kernel $(uname -r))"
+    if [ "$TOUCH" = "1" ] && [ "$ROTATE" != "270" ]; then
+      warn "Direção do touch validada só com ROTATE=270. Se ficar invertido, ajuste TOUCH_INVERT."
+    fi
+  else
+    ok "Overlay: waveshare32b dedicado (kernel $(uname -r))"
+  fi
   local t; t=$(vcgencmd get_throttled 2>/dev/null | cut -d= -f2 || echo "?")
   [ "$t" = "0x0" ] || warn "Energia: throttled=$t. Fonte insuficiente pode corromper o cartão SD."
   ok "Verificações iniciais"
@@ -59,8 +98,27 @@ step_packages() {
     sudo rm -rf /var/lib/apt/lists/*
     sudo apt-get update
   fi
-  sudo apt-get install -y xserver-xorg-video-fbdev xinput-calibrator fbi
+  # Conclui instalações interrompidas antes de instalar qualquer coisa
+  sudo dpkg --configure -a || true
+  sudo apt-get install -y xserver-xorg-video-fbdev xinput-calibrator xinput fbi
   ok "Pacotes instalados"
+}
+
+# Imagem Lite não tem desktop: instala o básico (barra, pcmanfm, lightdm)
+step_desktop_pkgs() {
+  if [ -f "$LDM" ] && [ -f "$PANEL_DEFAULT" ] && [ -f "$PCMAN_DEFAULT" ]; then
+    ok "Desktop já instalado"
+    return 0
+  fi
+  warn "Desktop não encontrado (imagem Lite?). Instalando $DESKTOP_PKG — no Pi 2 leva de 30 a 60 min"
+  if ! sudo apt-get install -y "$DESKTOP_PKG" lightdm; then
+    warn "Dependências pendentes — rodando apt --fix-broken install"
+    sudo apt-get --fix-broken install -y
+    sudo apt-get install -y "$DESKTOP_PKG" lightdm
+  fi
+  [ -f "$LDM" ] || fail "lightdm não ficou instalado. Rode 'sudo apt --fix-broken install' e repita o install."
+  sudo raspi-config nonint do_boot_behaviour B4
+  ok "Desktop instalado e configurado para abrir no boot"
 }
 
 step_config() {
@@ -69,17 +127,18 @@ step_config() {
 
   grep -q '^dtparam=spi=on' "$CFG" || printf '\n[all]\ndtparam=spi=on\n' | sudo tee -a "$CFG" > /dev/null
 
-  if grep -qE '^dtoverlay=waveshare32' "$CFG"; then
-    sudo sed -i -E "s/^dtoverlay=waveshare32.*/${OVERLAY_LINE}/" "$CFG"
-  else
-    printf '\n[all]\n%s\n' "$OVERLAY_LINE" | sudo tee -a "$CFG" > /dev/null
-  fi
+  # Remove linhas antigas do LCD/touch e grava as atuais (rodar de novo não duplica)
+  sudo sed -i -E '/^dtoverlay=(waveshare32|fbtft|ads7846)/d' "$CFG"
+  {
+    printf '\n[all]\n%s\n' "$LCD_LINE"
+    [ -z "$TOUCH_LINE" ] || printf '%s\n' "$TOUCH_LINE"
+  } | sudo tee -a "$CFG" > /dev/null
 
   sudo sed -i 's/^dtoverlay=vc4-kms-v3d/#dtoverlay=vc4-kms-v3d/' "$CFG"
   sync
 
   is_text "$CFG" || fail "$CFG ficou corrompido após a gravação. Backup em $CFG.bak-$STAMP"
-  ok "config.txt: overlay, SPI e KMS desativado (backup: $CFG.bak-$STAMP)"
+  ok "config.txt: overlay ($OVERLAY_MODE), SPI e KMS desativado (backup: $CFG.bak-$STAMP)"
 }
 
 step_x11() {
@@ -157,6 +216,28 @@ step_desktop() {
   fi
 }
 
+# Calibração inicial do touch (driver libinput). Não sobrescreve calibração já feita.
+step_touch() {
+  if [ "$OVERLAY_MODE" != "fbtft" ] || [ "$TOUCH" != "1" ]; then return 0; fi
+  if [ -f "$CALIB" ]; then
+    ok "Touch: calibração existente mantida ($CALIB)"
+    return 0
+  fi
+  write_calibration "$CALIB_MATRIX"
+  ok "Touch: calibração padrão gravada (refinar com ./lcd-setup.sh calibrate)"
+}
+
+write_calibration() {
+  sudo mkdir -p /etc/X11/xorg.conf.d
+  sudo tee "$CALIB" > /dev/null <<EOF
+Section "InputClass"
+        Identifier      "calibration"
+        MatchProduct    "${TOUCH_NAME}"
+        Option  "CalibrationMatrix"  "$1"
+EndSection
+EOF
+}
+
 step_splash() {
   if [ "$SPLASH" != "1" ]; then info "Tela de abertura desativada (SPLASH=0)"; return 0; fi
   info "Configurando tela de abertura no LCD"
@@ -210,8 +291,9 @@ cmd_backup() {
   sudo cp "$CFG" "$BACKUP_DIR/config.txt"
   sudo cp "$CMDLINE" "$BACKUP_DIR/cmdline.txt"
   [ -f "$XCONF" ] && sudo cp "$XCONF" "$BACKUP_DIR/"
+  [ -f "$CALIB" ] && sudo cp "$CALIB" "$BACKUP_DIR/"
   [ -f "$SPLASH_SVC" ] && sudo cp "$SPLASH_SVC" "$BACKUP_DIR/"
-  sudo cp "$LDM" "$BACKUP_DIR/"
+  [ -f "$LDM" ] && sudo cp "$LDM" "$BACKUP_DIR/"
   [ -d "$HOME/.config/lxpanel-pi" ] && cp -r "$HOME/.config/lxpanel-pi" "$BACKUP_DIR/"
   [ -d "$HOME/.config/pcmanfm" ] && cp -r "$HOME/.config/pcmanfm" "$BACKUP_DIR/"
   [ -f "$HOME/.Xresources" ] && cp "$HOME/.Xresources" "$BACKUP_DIR/Xresources"
@@ -223,10 +305,12 @@ cmd_backup() {
 cmd_install() {
   preflight install
   step_packages
+  step_desktop_pkgs
   step_config
   step_x11
   step_lightdm
   step_desktop
+  step_touch
   step_splash
   cmd_backup
   echo
@@ -239,12 +323,15 @@ cmd_check() {
   echo "== Sistema";            grep PRETTY /etc/os-release; uname -r
   echo "== Energia";            vcgencmd get_throttled || true
   echo "== config.txt";         if is_text "$CFG"; then echo "íntegro (texto)"; else echo "CORROMPIDO"; fi
-  grep -nE "waveshare|vc4-kms|spi=on" "$CFG" || true
+  grep -nE "waveshare|fbtft|ads7846|vc4-kms|spi=on" "$CFG" || true
+  echo "== Overlays";           ls "$OVERLAY_DIR"/waveshare32b.dtbo "$OVERLAY_DIR"/fbtft.dtbo 2>/dev/null || echo "nenhum overlay do LCD"
   echo "== cmdline.txt";        cat "$CMDLINE"
   echo "== Framebuffers";       cat /proc/fb
   echo "== Driver do LCD";      sudo dmesg | grep -iE "graphics fb1|fbtft|ili9340" | tail -5 || true
+  echo "== Touch";              grep -q "$TOUCH_NAME" /proc/bus/input/devices && echo "$TOUCH_NAME detectado" || echo "touch não detectado"
+  DISPLAY=:0 xinput list-props "$TOUCH_NAME" 2>/dev/null | grep "Calibration Matrix (" || true
   echo "== logind";             loginctl show-seat seat0 -p CanGraphical || true
-  echo "== lightdm";            grep -n "logind-check-graphical" "$LDM" || echo "ajuste ausente"
+  echo "== lightdm";            grep -n "logind-check-graphical" "$LDM" 2>/dev/null || echo "ajuste ausente ou lightdm não instalado"
   systemctl is-active lightdm || true
   echo "== Xorg (erros)";       grep -E "\(EE\)|fb1" /var/log/Xorg.0.log 2>/dev/null | tail -8 || true
   echo "== Barra";              grep -nE "iconsize|^\s*height=" "$PANEL" 2>/dev/null || echo "sem configuração de usuário"
@@ -255,12 +342,50 @@ cmd_check() {
   df -h / /boot/firmware
 }
 
+# Calibra o touch e grava o resultado como matriz do libinput (permanente)
 cmd_calibrate() {
   command -v xinput_calibrator > /dev/null || sudo apt-get install -y xinput-calibrator
+  command -v xinput > /dev/null || sudo apt-get install -y xinput
+  export DISPLAY=:0
+  xinput list --name-only 2>/dev/null | grep -qx "$TOUCH_NAME" \
+    || fail "Touch '$TOUCH_NAME' não encontrado no X. O desktop está aberto no LCD?"
+
+  # Zera a calibração atual para medir os valores brutos
+  xinput set-prop "$TOUCH_NAME" "libinput Calibration Matrix" 1 0 0 0 1 0 0 0 1 2>/dev/null \
+    || warn "Não consegui zerar a matriz atual — o resultado pode sair deslocado"
+
   info "Toque nos alvos que aparecerem no LCD"
-  DISPLAY=:0 xinput_calibrator
-  info "Para manter a calibração, salve o bloco 'Section \"InputClass\"' acima em"
-  info "/etc/X11/xorg.conf.d/99-calibration.conf"
+  local out; out=$(xinput_calibrator 2>&1) || true
+  printf '%s\n' "$out"
+
+  val() { printf '%s\n' "$out" | sed -n "s/.*\"$1\"[[:space:]]*\"\(-\{0,1\}[0-9]*\)\".*/\1/p" | head -1; }
+  local minx maxx miny maxy rx0 rx1 ry0 ry1
+  minx=$(val MinX); maxx=$(val MaxX); miny=$(val MinY); maxy=$(val MaxY)
+  rx0=$(printf '%s\n' "$out" | sed -n 's/.*min_x=\([0-9]*\).*/\1/p' | head -1)
+  rx1=$(printf '%s\n' "$out" | sed -n 's/.*max_x=\([0-9]*\).*/\1/p' | head -1)
+  ry0=$(printf '%s\n' "$out" | sed -n 's/.*min_y=\([0-9]*\).*/\1/p' | head -1)
+  ry1=$(printf '%s\n' "$out" | sed -n 's/.*max_y=\([0-9]*\).*/\1/p' | head -1)
+  for v in "$minx" "$maxx" "$miny" "$maxy" "$rx0" "$rx1" "$ry0" "$ry1"; do
+    [ -n "$v" ] || fail "Não consegui ler o resultado da calibração. Rode de novo e toque nos 4 alvos."
+  done
+  [ "$minx" != "$maxx" ] && [ "$miny" != "$maxy" ] || fail "Valores de calibração inválidos. Rode de novo."
+
+  # x' = x*(faixa)/(MaxX-MinX) + (início - MinX)/(MaxX-MinX); idem para y
+  local matrix
+  matrix=$(awk -v a="$minx" -v b="$maxx" -v c="$miny" -v d="$maxy" \
+               -v r0="$rx0" -v r1="$rx1" -v s0="$ry0" -v s1="$ry1" 'BEGIN {
+    dx = b - a; dy = d - c
+    printf "%.4f 0 %.4f 0 %.4f %.4f 0 0 1", (r1 - r0) / dx, (r0 - a) / dx, (s1 - s0) / dy, (s0 - c) / dy
+  }')
+
+  # shellcheck disable=SC2086
+  xinput set-prop "$TOUCH_NAME" "libinput Calibration Matrix" $matrix 2>/dev/null || true
+  write_calibration "$matrix"
+  ok "Calibração aplicada e gravada em $CALIB"
+  info "Matriz: $matrix"
+  if printf '%s\n' "$out" | grep -qE '"SwapXY"[[:space:]]*"1"'; then
+    warn "O calibrador indicou eixos trocados. Ajuste TOUCH_INVERT e rode o install de novo."
+  fi
 }
 
 cmd_vnc() {
@@ -293,15 +418,17 @@ usage() {
   cat <<EOF
 Uso: ./lcd-setup.sh <comando>
 
-  install    Aplica toda a configuração do LCD
+  install    Aplica toda a configuração do LCD (e instala o desktop se faltar)
   check      Diagnóstico completo
   backup     Salva as configurações em $BACKUP_DIR
-  calibrate  Calibra o touch
+  calibrate  Calibra o touch e grava a calibração
   vnc        Acesso remoto à tela via VNC (túnel SSH)
   hdmi       Devolve o desktop ao HDMI
 
 Parâmetros: ROTATE=$ROTATE SPEED=$SPEED DPI=$DPI ICONSIZE=$ICONSIZE
             PANEL_HEIGHT=$PANEL_HEIGHT DESKTOP_ICON=$DESKTOP_ICON SPLASH=$SPLASH
+            TOUCH=$TOUCH TOUCH_INVERT=$TOUCH_INVERT DESKTOP_PKG=$DESKTOP_PKG
+            CALIB_MATRIX="$CALIB_MATRIX"
 Exemplo:    SPLASH=0 ./lcd-setup.sh install
 EOF
 }

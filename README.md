@@ -12,8 +12,12 @@ no Raspberry Pi OS Trixie, usando X11 + fbdev. Um único script aplica tudo.
 |---|---|
 | Placa | Raspberry Pi 2 Model B V1.1 |
 | Sistema | Raspberry Pi OS 13 (Trixie) 32-bit com desktop |
-| Kernel | 6.18 |
+| Kernel | 6.18 (overlay `waveshare32b`) e kernels atuais sem esse overlay (overlay `fbtft`) |
 | Tela | Waveshare / SpotPear 3.2inch RPi LCD — marcação **V3** (modelo B) |
+
+> **Kernels atuais:** o overlay dedicado `waveshare32b.dtbo` foi removido do kernel do
+> Raspberry Pi OS. O script detecta isso e usa o overlay genérico `fbtft` com o mesmo
+> preset, mais o overlay `ads7846` para o touch. Nada muda no comando de instalação.
 
 ---
 
@@ -29,7 +33,9 @@ no Raspberry Pi OS Trixie, usando X11 + fbdev. Um único script aplica tudo.
 No **Raspberry Pi Imager**:
 
 1. **Dispositivo:** Raspberry Pi 2.
-2. **Sistema:** Raspberry Pi OS (32-bit), versão com desktop.
+2. **Sistema:** Raspberry Pi OS (32-bit), versão com desktop (recomendado).
+   Se for gravada a versão Lite, o script instala o desktop básico (`rpd-x-core`),
+   o que leva de 30 a 60 minutos no Pi 2.
 3. **Armazenamento:** o cartão SD.
 4. Na etapa de **personalização**:
    - Nome do host, usuário e senha.
@@ -85,11 +91,15 @@ ROTATE=90 SPEED=8000000 DPI=60 ./lcd-setup.sh install
 | `PANEL_HEIGHT` | 20 | Altura da barra superior |
 | `DESKTOP_ICON` | 24 | Ícones da área de trabalho (ex.: lixeira) |
 | `SPLASH` | 1 | Tela de abertura em tela cheia no LCD e mensagens de boot ocultas (`0` desativa) |
+| `TOUCH` | 1 | Configura o touch no modo `fbtft` (`0` desativa) |
+| `TOUCH_INVERT` | `invx` | Inversão do touch: `invx`, `invy`, `invx,invy` ou `none`. Com `swapxy`, `invx` corrige cima/baixo |
+| `CALIB_MATRIX` | `1.1940 0 -0.0821 0 1.2329 -0.1807 0 0 1` | Calibração inicial do touch (libinput). Refine com `calibrate` |
+| `DESKTOP_PKG` | `rpd-x-core` | Pacote de desktop instalado só se ele faltar (imagem Lite) |
 
 ## 6. Ajustes finais
 
 ```bash
-./lcd-setup.sh calibrate   # calibrar o touch (tocar nos alvos no LCD)
+./lcd-setup.sh calibrate   # calibrar o touch (tocar nos alvos no LCD); grava sozinho
 ./lcd-setup.sh backup      # salvar as configurações em ~/backup-lcd
 ```
 
@@ -133,6 +143,10 @@ Conecte um visualizador VNC (RealVNC Viewer, TightVNC) em `localhost:5900`.
 | Ajuste | Motivo |
 |---|---|
 | `dtoverlay=waveshare32b,...,speed=16000000` em `/boot/firmware/config.txt` | No Trixie, o config fica em `/boot/firmware`. A V3 inicializa com o overlay `waveshare32b`; a 32 MHz, a tela fica branca |
+| Kernels sem `waveshare32b.dtbo`: `dtoverlay=fbtft,spi0-0,waveshare32b,...,reset_pin=27,dc_pin=22` | O preset da tela passou a fazer parte do overlay genérico `fbtft` |
+| `dtoverlay=ads7846,cs=1,penirq=17,swapxy,pmax=255,xohms=60,invx` | No modo `fbtft` o touch é um overlay separado; com `swapxy`, o `invx` acerta a direção vertical em `ROTATE=270` |
+| `/etc/X11/xorg.conf.d/99-calibration.conf` com `CalibrationMatrix` | O touch usa o driver libinput, que não lê `MinX`/`MaxX`; o `calibrate` converte o resultado em matriz |
+| Instalação do desktop se faltar (`rpd-x-core` + lightdm) | A imagem Lite não tem desktop; no Trixie o `raspberrypi-ui-mods` não existe mais |
 | KMS desativado (`#dtoverlay=vc4-kms-v3d`) | Com KMS, o X falha com *"Cannot run in framebuffer mode"* |
 | X11 em vez de Wayland | O Wayland não desenha em tela SPI |
 | `/etc/X11/xorg.conf.d/99-lcd.conf` | Força o X a usar o `/dev/fb1` (LCD) |
@@ -155,6 +169,10 @@ Conecte um visualizador VNC (RealVNC Viewer, TightVNC) em `localhost:5900`.
 | Dispositivo USB não aparece no `lsblk` | Falta de energia | Mesma ação acima |
 | Texto aparece por cima da tela de abertura | Mensagens de boot no mesmo terminal | Conferir `cmdline.txt` com `./lcd-setup.sh check` |
 | Quer ver as mensagens de boot | — | `SPLASH=0 ./lcd-setup.sh install` e restaurar `cmdline.txt.bak-*` |
+| *Overlay waveshare32b não encontrado* | Versão antiga do script em kernel atual | Usar a versão atual do script (detecta o `fbtft`) |
+| Touch com cima e baixo trocados | Inversão errada para a rotação | `TOUCH_INVERT=none ./lcd-setup.sh install` (ou `invy`, `invx,invy`) e reiniciar |
+| Touch na direção certa, mas deslocado | Calibração padrão não serve para a sua tela | `./lcd-setup.sh calibrate` |
+| *dependências não satisfeitas* ao instalar o desktop | Instalação interrompida | `sudo dpkg --configure -a && sudo apt --fix-broken install` |
 **Antes de qualquer `apt upgrade`, rode `./lcd-setup.sh backup`.**
 
 ## Sobre boot por USB (Pi 2 v1.1)
